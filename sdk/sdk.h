@@ -2,6 +2,7 @@
 #define SDK_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "defines.h"
 #include "watchdog.c"
 #include "divmod.c"
@@ -16,5 +17,7 @@
 #include "fat.c"
 #include "battery.c"
 #include "bat.c"
+#include "rtc.c"
+#include "rtc.h"
 
 #endif

@@ -1,0 +1,633 @@
+
+#include <stdint.h>
+#include "../../sdk/sdk.h"
+
+/* =========================================================
+   CONFIGURATION
+   ========================================================= */
+
+/* Change this to "/" to search the SD card root. */
+#define BMP_DIRECTORY       "/IMAGES"
+
+#ifndef BMP_DEBUG
+#define BMP_DEBUG 0
+#endif
+
+#define BMP_MAX_WIDTH       1024
+#define BMP_MAX_HEIGHT      4096
+#define BMP_MAX_FILES       14
+
+#define BMP_OK              0
+#define BMP_OPEN_ERROR     -1
+#define BMP_READ_ERROR     -2
+#define BMP_FORMAT_ERROR   -3
+#define BMP_SEEK_ERROR     -4
+
+#define BMP_BI_RGB          0
+
+#define FAT_ATTR_DIRECTORY  0x10
+#define FAT_ATTR_VOLUME_ID  0x08
+
+/* =========================================================
+   DEBUG
+   ========================================================= */
+
+#if BMP_DEBUG
+
+static void bmp_status(const char *message)
+{
+    fb_clear(COL_BLACK);
+
+    draw_string8(
+        5, 5, message,
+        COL_WHITE, COL_BLACK, 0, 0
+    );
+
+    fb_flush();
+    watchdog_feed();
+}
+
+#else
+#define bmp_status(message) ((void)0)
+#endif
+
+/* =========================================================
+   BUFFERS
+   ========================================================= */
+
+static uint8_t bmp_row[BMP_MAX_WIDTH * 4];
+static uint16_t bmp_palette[256];
+
+static fat_ent_t bmp_files[BMP_MAX_FILES];
+static int bmp_file_count = 0;
+
+/* =========================================================
+   COLOR CONVERSION
+   ========================================================= */
+
+static uint16_t bmp_rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return ((uint16_t)(r & 0xF8) << 8) |
+           ((uint16_t)(g & 0xFC) << 3) |
+           ((uint16_t)b >> 3);
+}
+
+static uint16_t bmp_rgb555_to_565(uint16_t pixel)
+{
+    uint16_t r = (pixel >> 10) & 0x1F;
+    uint16_t g = (pixel >> 5) & 0x1F;
+    uint16_t b = pixel & 0x1F;
+
+    uint16_t g6 = (g << 1) | (g >> 4);
+
+    return (r << 11) | (g6 << 5) | b;
+}
+
+/* =========================================================
+   LITTLE-ENDIAN READERS
+   ========================================================= */
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)p[0] |
+           ((uint16_t)p[1] << 8);
+}
+
+static uint32_t read32(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/* =========================================================
+   PIXEL DECODER
+   ========================================================= */
+
+static uint16_t bmp_get_pixel(
+    const uint8_t *row,
+    uint32_t x,
+    uint16_t bpp
+)
+{
+    switch (bpp)
+    {
+        case 8:
+            return bmp_palette[row[x]];
+
+        case 16:
+        {
+            uint16_t pixel = read16(&row[x * 2]);
+            return bmp_rgb555_to_565(pixel);
+        }
+
+        case 24:
+        {
+            const uint8_t *p = &row[x * 3];
+            return bmp_rgb565(p[2], p[1], p[0]);
+        }
+
+        case 32:
+        {
+            const uint8_t *p = &row[x * 4];
+            return bmp_rgb565(p[2], p[1], p[0]);
+        }
+    }
+
+    return COL_BLACK;
+}
+
+/* =========================================================
+   BMP VIEWER
+   ========================================================= */
+
+int bmp_view(const char *path, int screen_x, int screen_y)
+{
+    fat_file_t file;
+    uint8_t header[54];
+
+    bmp_status("OPENING FILE");
+
+    if (fat_open(&file, path) != FAT_OK)
+        return BMP_OPEN_ERROR;
+
+    bmp_status("READING HEADER");
+
+    int n = fat_read(&file, header, 54);
+
+    if (n != 54)
+        return BMP_READ_ERROR;
+
+    if (header[0] != 'B' || header[1] != 'M')
+        return BMP_FORMAT_ERROR;
+
+    uint32_t pixel_offset = read32(header + 10);
+    uint32_t dib_size = read32(header + 14);
+
+    int32_t width = (int32_t)read32(header + 18);
+    int32_t height = (int32_t)read32(header + 22);
+
+    uint16_t planes = read16(header + 26);
+    uint16_t bpp = read16(header + 28);
+
+    uint32_t compression = read32(header + 30);
+    uint32_t colors_used = read32(header + 46);
+
+    bmp_status("CHECKING FORMAT");
+
+    if (dib_size < 40)
+        return BMP_FORMAT_ERROR;
+
+    if (width <= 0 || height == 0 || height == INT32_MIN)
+        return BMP_FORMAT_ERROR;
+
+    if (planes != 1)
+        return BMP_FORMAT_ERROR;
+
+    if (bpp != 8 && bpp != 16 &&
+        bpp != 24 && bpp != 32)
+        return BMP_FORMAT_ERROR;
+
+    if (compression != BMP_BI_RGB)
+        return BMP_FORMAT_ERROR;
+
+    if ((uint32_t)width > BMP_MAX_WIDTH)
+        return BMP_FORMAT_ERROR;
+
+    uint32_t src_width = (uint32_t)width;
+
+    uint32_t src_height = height < 0
+        ? (uint32_t)(-height)
+        : (uint32_t)height;
+
+    if (src_height > BMP_MAX_HEIGHT)
+        return BMP_FORMAT_ERROR;
+
+    bmp_status("FORMAT OK");
+
+    uint32_t row_size =
+        ((src_width * bpp + 31U) >> 5) << 2;
+
+    if (row_size > sizeof(bmp_row))
+        return BMP_FORMAT_ERROR;
+
+    if (file.size < 54U)
+        return BMP_FORMAT_ERROR;
+
+    if (dib_size > file.size - 14U)
+        return BMP_FORMAT_ERROR;
+
+    uint32_t palette_offset = 14U + dib_size;
+
+    if (pixel_offset < palette_offset ||
+        pixel_offset > file.size)
+        return BMP_FORMAT_ERROR;
+
+    uint64_t image_size =
+        (uint64_t)row_size * (uint64_t)src_height;
+
+    if (image_size > (uint64_t)(file.size - pixel_offset))
+        return BMP_FORMAT_ERROR;
+
+    bmp_status("SIZE CHECK");
+
+    /* =====================================================
+       LOAD PALETTE
+       ===================================================== */
+
+    if (bpp == 8)
+    {
+        bmp_status("LOADING PALETTE");
+
+        uint32_t palette_count =
+            colors_used ? colors_used : 256U;
+
+        if (palette_count > 256U)
+            return BMP_FORMAT_ERROR;
+
+        uint32_t palette_bytes = palette_count * 4U;
+
+        if (palette_bytes > pixel_offset - palette_offset)
+            return BMP_FORMAT_ERROR;
+
+        uint8_t palette_data[1024];
+
+        if (fat_seek(&file, palette_offset) != FAT_OK)
+            return BMP_SEEK_ERROR;
+
+        if (fat_read(&file, palette_data, palette_bytes)
+            != (int)palette_bytes)
+            return BMP_READ_ERROR;
+
+        for (uint32_t i = 0; i < palette_count; i++)
+        {
+            const uint8_t *p = &palette_data[i * 4];
+
+            bmp_palette[i] = bmp_rgb565(
+                p[2], p[1], p[0]
+            );
+        }
+    }
+
+    /* =====================================================
+       CALCULATE OUTPUT SIZE
+       ===================================================== */
+
+    bmp_status("CALCULATING SCALE");
+
+    if (screen_x < 0 || screen_y < 0 ||
+        screen_x >= LCD_W || screen_y >= LCD_H)
+        return BMP_FORMAT_ERROR;
+
+    uint32_t available_width = LCD_W - screen_x;
+    uint32_t available_height = LCD_H - screen_y;
+
+    uint32_t dst_width;
+    uint32_t dst_height;
+
+    if (src_width * available_height >
+        src_height * available_width)
+    {
+        dst_width = available_width;
+        dst_height =
+            (src_height * available_width) / src_width;
+    }
+    else
+    {
+        dst_height = available_height;
+        dst_width =
+            (src_width * available_height) / src_height;
+    }
+
+    if (dst_width == 0)
+        dst_width = 1;
+
+    if (dst_height == 0)
+        dst_height = 1;
+
+    int offset_x =
+        screen_x + (int)((available_width - dst_width) / 2U);
+
+    int offset_y =
+        screen_y + (int)((available_height - dst_height) / 2U);
+
+    /* =====================================================
+       SEEK TO PIXELS
+       ===================================================== */
+
+    bmp_status("SEEKING PIXELS");
+
+    if (fat_seek(&file, pixel_offset) != FAT_OK)
+        return BMP_SEEK_ERROR;
+
+    /* =====================================================
+       RENDER IMAGE
+       ===================================================== */
+
+    bmp_status("RENDERING");
+
+    uint32_t current_source_row = 0;
+
+    if (fat_read(&file, bmp_row, row_size) != (int)row_size)
+        return BMP_READ_ERROR;
+
+    for (uint32_t step = 0; step < dst_height; step++)
+    {
+        watchdog_feed();
+
+        uint32_t dy = height > 0
+            ? dst_height - 1U - step
+            : step;
+
+        uint32_t logical_y =
+            (dy * src_height) / dst_height;
+
+        uint32_t source_y = height > 0
+            ? src_height - 1U - logical_y
+            : logical_y;
+
+        while (current_source_row < source_y)
+        {
+            if (fat_read(&file, bmp_row, row_size)
+                != (int)row_size)
+                return BMP_READ_ERROR;
+
+            current_source_row++;
+        }
+
+        int dst_y = offset_y + (int)dy;
+
+        for (uint32_t dx = 0; dx < dst_width; dx++)
+        {
+            uint32_t sx = (dx * src_width) / dst_width;
+
+            uint16_t color = bmp_get_pixel(
+                bmp_row, sx, bpp
+            );
+
+            fb_pixel(
+                offset_x + (int)dx,
+                dst_y,
+                color
+            );
+        }
+    }
+
+    fb_flush();
+
+    return BMP_OK;
+}
+
+/* =========================================================
+   FILE SELECTOR
+   ========================================================= */
+
+static int bmp_has_extension(const char *name)
+{
+    int i = 0;
+
+    while (name[i])
+        i++;
+
+    if (i < 4)
+        return 0;
+
+    char a = name[i - 3];
+    char b = name[i - 2];
+    char c = name[i - 1];
+
+    if (a >= 'a' && a <= 'z') a -= 32;
+    if (b >= 'a' && b <= 'z') b -= 32;
+    if (c >= 'a' && c <= 'z') c -= 32;
+
+    return name[i - 4] == '.' &&
+           a == 'B' && b == 'M' && c == 'P';
+}
+
+static void bmp_draw_number(int x, int y, int number)
+{
+    char text[5];
+    int i = 0;
+
+    if (number >= 10)
+        text[i++] = '0' + (number / 10);
+
+    text[i++] = '0' + (number % 10);
+    text[i] = '\0';
+
+    draw_string8(
+        x, y, text,
+        COL_WHITE, COL_BLACK, 0, 0
+    );
+}
+
+/* =========================================================
+   BUILD FILE PATH
+   ========================================================= */
+
+static int bmp_build_path(char *path, const char *filename)
+{
+    int i = 0;
+    int j = 0;
+
+    /* Copy configured directory. */
+
+    while (BMP_DIRECTORY[i] && i < 110)
+    {
+        path[i] = BMP_DIRECTORY[i];
+        i++;
+    }
+
+    /* Add separator unless this is root. */
+
+    if (i == 0 || path[i - 1] != '/')
+        path[i++] = '/';
+
+    /* Append filename. */
+
+    while (filename[j] && i < 127)
+        path[i++] = filename[j++];
+
+    if (filename[j] != '\0')
+        return -1;
+
+    path[i] = '\0';
+
+    return 0;
+}
+
+/* =========================================================
+   FILE SELECTOR
+   ========================================================= */
+
+static int bmp_select_file(char *path)
+{
+    fat_dir_t dir;
+    fat_ent_t ent;
+
+    bmp_file_count = 0;
+
+    if (fat_opendir(&dir, BMP_DIRECTORY) != FAT_OK)
+        return -1;
+
+    int result;
+
+    while ((result = fat_dir_next(&dir, &ent)) == 0)
+    {
+        watchdog_feed();
+
+        if (ent.attr & FAT_ATTR_VOLUME_ID)
+            continue;
+
+        if (ent.attr & FAT_ATTR_DIRECTORY)
+            continue;
+
+        if (!bmp_has_extension(ent.name))
+            continue;
+
+        if (bmp_file_count >= BMP_MAX_FILES)
+            break;
+
+        bmp_files[bmp_file_count++] = ent;
+    }
+
+    if (result < 0)
+        return -1;
+
+    if (bmp_file_count == 0)
+    {
+        fb_clear(COL_BLACK);
+
+        draw_string8(
+            5, 5, "NO BMP FILES",
+            COL_RED, COL_BLACK, 0, 0
+        );
+
+        fb_flush();
+        return -1;
+    }
+
+    /* Draw selector. */
+
+    fb_clear(COL_BLACK);
+
+    draw_string8(
+        5, 2, "SELECT IMAGE",
+        COL_WHITE, COL_BLACK, 0, 0
+    );
+
+    for (int i = 0; i < bmp_file_count; i++)
+    {
+        int y = 16 + i * 10;
+
+        bmp_draw_number(5, y, i);
+
+        draw_string8(
+            25, y,
+            bmp_files[i].name,
+            COL_GREEN, COL_BLACK, 0, 0
+        );
+    }
+
+    fb_flush();
+
+    /* Read numeric selection. */
+
+    int selected = kp_read_int();
+
+    if (selected == -1)
+        return -2;  /* Cancelled by LEFT. */
+
+    if (selected < 0 || selected >= bmp_file_count)
+        return -1;
+
+    if (bmp_build_path(path, bmp_files[selected].name) != 0)
+        return -1;
+
+    return 0;
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+void main(void)
+{
+    char selected_path[128];
+
+    fb_clear(COL_BLACK);
+    fb_flush();
+
+    bmp_status("SD INITIALIZING");
+
+    int r = sd_init();
+
+    if (r != 0)
+    {
+        bmp_status("SD INIT FAILED");
+        goto wait;
+    }
+
+    bmp_status("MOUNTING FAT");
+
+    r = fat_mount();
+
+    if (r != FAT_OK)
+    {
+        bmp_status("FAT MOUNT FAILED");
+        goto wait;
+    }
+
+    for (;;)
+    {
+        r = bmp_select_file(selected_path);
+
+        if (r == -2)
+            jump(0x70000000);
+
+        if (r != 0)
+            continue;
+
+        r = bmp_view(selected_path, 0, 0);
+
+        if (r != BMP_OK)
+        {
+            fb_clear(COL_BLACK);
+
+            draw_string8(
+                5, 5, "BMP ERROR",
+                COL_RED, COL_BLACK, 0, 0
+            );
+
+            fb_flush();
+        }
+
+        /* Wait for user. */
+
+        for (;;)
+        {
+            watchdog_feed();
+
+            if (KP_LEFT == 0)
+                jump(0x70000000);
+
+            if (KP_RIGHT == 0)
+                break;
+        }
+
+        while (KP_RIGHT == 0)
+            watchdog_feed();
+    }
+
+wait:
+
+    for (;;)
+    {
+        watchdog_feed();
+
+        if (KP_LEFT == 0)
+            jump(0x70000000);
+    }
+}
+

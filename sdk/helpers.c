@@ -139,9 +139,11 @@ int kp_read_int(void)
                 KP_8 == 0 || KP_9 == 0
             );
         }
-
+	watchdog_feed();
         if (KP_OK == 0)
             return value;
+	if(KP_LEFT==0)
+		return -1;
     }
 }
 void kp_blink(uint32_t cycles){
