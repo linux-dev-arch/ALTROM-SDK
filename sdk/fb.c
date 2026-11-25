@@ -21,6 +21,9 @@
 #define COL_GREEN 0x07E0
 #define COL_BLUE  0x001F
 #define COL_YELLOW 0xffc0
+#define COL_VIOLET 0xa816
+#define COL_CYAN 0x07ff
+#define COL_TEAL 0x07f3
 /* set the panel's RAM write window and start a RAMWR */
 static void lcd_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {

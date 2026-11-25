@@ -1,6 +1,8 @@
 #ifndef SDK_H
 #define SDK_H
 
+#define ALTROM_RETURN 0x003D8200
+
 #include <stdint.h>
 #include <stddef.h>
 #include "defines.h"
@@ -19,5 +21,5 @@
 #include "bat.c"
 #include "rtc.c"
 #include "rtc.h"
-
+#include "audio.c"
 #endif

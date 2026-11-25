@@ -161,8 +161,8 @@ static void chip8_draw(void)
     fb_flush_rect(24, 112, 192, 96);
 }
 
-/*
- * GPT4 hardware-based CHIP-8 timer scheduler.
+
+/*GPT4 hardware-based CHIP-8 timer scheduler.
  *
  * GPT4 frequency: 26 MHz
  * CHIP-8 timer frequency: 60 Hz

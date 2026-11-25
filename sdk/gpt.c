@@ -16,7 +16,6 @@
  */
 
 #define TIMER_PRESENT 1
-
 #ifndef GPT_BASE_ADDR
 #define GPT_BASE_ADDR 0xA00C0000
 #endif
